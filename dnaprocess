@@ -247,7 +247,8 @@ def main() -> int:
     diff.add_argument("after")
     diff.set_defaults(func=cmd_diff)
 
-    return args.func(args)
+    parsed = parser.parse_args()
+    return parsed.func(parsed)
 
 
 if __name__ == "__main__":
