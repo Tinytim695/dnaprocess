@@ -1,52 +1,254 @@
 #!/usr/bin/env python3
-import argparse,hashlib,json,os
+"""DNAProcess: local Linux process fingerprinting and snapshot diffing."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import sys
+import time
 from pathlib import Path
+from typing import Any
 
-def txt(p):
- try: return Path(p).read_text(errors="replace").strip()
- except Exception: return None
 
-def snap(pid):
- b=Path("/proc")/str(pid)
- if not b.exists(): raise SystemExit("PID "+str(pid)+" not found")
- try: exe=os.readlink(b/"exe")
- except Exception: exe=None
- digest=None
- if exe:
-  try:
-   h=hashlib.sha256()
-   with open(exe,"rb") as f:
-    for chunk in iter(lambda:f.read(1048576),b""): h.update(chunk)
-   digest=h.hexdigest()
-  except Exception: pass
- status={}
- for line in (txt(b/"status") or "").splitlines():
-  if ":" in line:
-   k,v=line.split(":",1)
-   if k in {"Name","Uid","Gid","PPid","Threads","State"}: status[k]=v.strip()
- try: cwd=os.readlink(b/"cwd")
- except Exception: cwd=None
- try: root=os.readlink(b/"root")
- except Exception: root=None
- try: fd_count=sum(1 for _ in (b/"fd").iterdir())
- except Exception: fd_count=None
- maps=txt(b/"maps")
- cmd=txt(b/"cmdline")
- return {"pid":pid,"exe":exe,"exe_sha256":digest,"cmdline":cmd.replace("\0"," ") if cmd is not None else None,
-         "status":status,"cwd":cwd,"root":root,"fd_count":fd_count,
-         "map_count":len((maps or "").splitlines())}
+PROC = Path("/proc")
 
-def main():
- ap=argparse.ArgumentParser(description="DNAProcess local Linux process fingerprint")
- sub=ap.add_subparsers(dest="mode",required=True)
- s=sub.add_parser("snapshot"); s.add_argument("pid",type=int)
- d=sub.add_parser("diff"); d.add_argument("before"); d.add_argument("after")
- a=ap.parse_args()
- if a.mode=="snapshot":
-  print(json.dumps(snap(a.pid),indent=2,sort_keys=True)); return
- before=json.loads(Path(a.before).read_text()); after=json.loads(Path(a.after).read_text())
- for k in sorted(set(before)|set(after)):
-  if before.get(k)!=after.get(k):
-   print(k+":"); print("  before:",repr(before.get(k))); print("  after :",repr(after.get(k)))
 
-if __name__=="__main__": main()
+def sha256_file(path: Path, limit: int | None = None) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        total = 0
+        with path.open("rb", buffering=0) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                if limit is not None:
+                    remaining = limit - total
+                    if remaining <= 0:
+                        break
+                    chunk = chunk[:remaining]
+                digest.update(chunk)
+                total += len(chunk)
+                if limit is not None and total >= limit:
+                    break
+        return digest.hexdigest()
+    except (OSError, PermissionError):
+        return None
+
+
+def read_text(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, PermissionError):
+        return default
+
+
+def readlink(path: Path) -> str | None:
+    try:
+        return os.readlink(path)
+    except (OSError, PermissionError):
+        return None
+
+
+def parse_status(pid_dir: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for line in read_text(pid_dir / "status").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip()
+        if key in {"Name", "State", "Uid", "Gid", "Threads", "PPid"}:
+            result[key] = value
+    return result
+
+
+def namespace_ids(pid_dir: Path) -> dict[str, str]:
+    result = {}
+    ns_dir = pid_dir / "ns"
+    try:
+        for entry in ns_dir.iterdir():
+            target = readlink(entry)
+            if target:
+                result[entry.name] = target
+    except (OSError, PermissionError):
+        pass
+    return dict(sorted(result.items()))
+
+
+def fd_summary(pid_dir: Path) -> dict[str, Any]:
+    fd_dir = pid_dir / "fd"
+    count = 0
+    types: dict[str, int] = {}
+    try:
+        for entry in fd_dir.iterdir():
+            count += 1
+            target = readlink(entry) or "unknown"
+            kind = target.split(":", 1)[0] if target.startswith(("socket:", "pipe:", "anon_inode:")) else (
+                "file" if target.startswith("/") else "other"
+            )
+            types[kind] = types.get(kind, 0) + 1
+    except (OSError, PermissionError):
+        pass
+    return {"count": count, "types": dict(sorted(types.items()))}
+
+
+def maps_summary(pid_dir: Path) -> dict[str, Any]:
+    maps = pid_dir / "maps"
+    count = 0
+    file_paths: set[str] = set()
+    try:
+        for line in maps.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line:
+                continue
+            count += 1
+            match = re.search(r"(/[^\s]+)$", line)
+            if match:
+                file_paths.add(match.group(1))
+    except (OSError, PermissionError):
+        pass
+
+    return {
+        "regions": count,
+        "file_paths": sorted(file_paths)[:500],
+    }
+
+
+def fingerprint(pid: int) -> dict[str, Any]:
+    pid_dir = PROC / str(pid)
+    if not pid_dir.is_dir():
+        raise FileNotFoundError(f"process {pid} does not exist")
+
+    exe = readlink(pid_dir / "exe")
+    cmdline_raw = (pid_dir / "cmdline")
+    try:
+        cmdline = cmdline_raw.read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except (OSError, PermissionError):
+        cmdline = ""
+
+    status = parse_status(pid_dir)
+    stat_fields = read_text(pid_dir / "stat").split()
+    starttime_ticks = stat_fields[21] if len(stat_fields) > 21 else None
+
+    record: dict[str, Any] = {
+        "schema": 1,
+        "captured_at": time.time(),
+        "host": {
+            "platform": platform.system(),
+            "kernel": platform.release(),
+            "machine": platform.machine(),
+        },
+        "process": {
+            "pid": pid,
+            "ppid": int(status.get("PPid", 0)) if str(status.get("PPid", "")).isdigit() else status.get("PPid"),
+            "name": status.get("Name"),
+            "state": status.get("State"),
+            "uid": status.get("Uid"),
+            "gid": status.get("Gid"),
+            "threads": int(status["Threads"]) if str(status.get("Threads", "")).isdigit() else status.get("Threads"),
+            "exe": exe,
+            "exe_sha256": sha256_file(pid_dir / "exe"),
+            "cmdline": cmdline,
+            "starttime_ticks": starttime_ticks,
+            "namespaces": namespace_ids(pid_dir),
+            "fds": fd_summary(pid_dir),
+            "maps": maps_summary(pid_dir),
+        },
+    }
+
+    canonical = json.dumps(record["process"], sort_keys=True, separators=(",", ":")).encode()
+    record["process"]["fingerprint_sha256"] = hashlib.sha256(canonical).hexdigest()
+    return record
+
+
+def load_snapshot(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"DNAProcess: snapshot not found: {path}") from None
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"DNAProcess: invalid JSON in {path}: {exc}") from None
+
+
+def diff_dict(before: dict[str, Any], after: dict[str, Any], prefix: str = "") -> list[str]:
+    changes: list[str] = []
+    keys = sorted(set(before) | set(after))
+    for key in keys:
+        label = f"{prefix}.{key}" if prefix else key
+        if key not in before:
+            changes.append(f"+ {label} = {after[key]!r}")
+        elif key not in after:
+            changes.append(f"- {label} = {before[key]!r}")
+        elif isinstance(before[key], dict) and isinstance(after[key], dict):
+            changes.extend(diff_dict(before[key], after[key], label))
+        elif before[key] != after[key]:
+            changes.append(f"~ {label}: {before[key]!r} -> {after[key]!r}")
+    return changes
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    if platform.system() != "Linux" or not PROC.exists():
+        print("DNAProcess: snapshot requires Linux /proc", file=sys.stderr)
+        return 1
+
+    try:
+        record = fingerprint(args.pid)
+    except FileNotFoundError as exc:
+        print(f"DNAProcess: {exc}", file=sys.stderr)
+        return 1
+
+    output = json.dumps(record, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        Path(args.output).write_text(output, encoding="utf-8")
+        print(f"DNAProcess: snapshot={args.output}")
+    else:
+        sys.stdout.write(output)
+    return 0
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    before = load_snapshot(Path(args.before))
+    after = load_snapshot(Path(args.after))
+    bproc = before.get("process", {})
+    aproc = after.get("process", {})
+
+    if bproc.get("pid") != aproc.get("pid"):
+        print(f"PID: {bproc.get('pid')} -> {aproc.get('pid')}")
+    print(f"Fingerprint: {bproc.get('fingerprint_sha256')} -> {aproc.get('fingerprint_sha256')}")
+
+    changes = diff_dict(bproc, aproc)
+    if not changes:
+        print("No process-field changes.")
+        return 0
+
+    print("Changes:")
+    for change in changes:
+        print(change)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Fingerprint a local Linux process and diff snapshots."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    snap = sub.add_parser("snapshot", help="capture a process snapshot")
+    snap.add_argument("pid", type=int)
+    snap.add_argument("-o", "--output", help="write JSON to this file")
+    snap.set_defaults(func=cmd_snapshot)
+
+    diff = sub.add_parser("diff", help="compare two snapshots")
+    diff.add_argument("before")
+    diff.add_argument("after")
+    diff.set_defaults(func=cmd_diff)
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
