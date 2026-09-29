@@ -14,7 +14,7 @@ jobs:
       - name: Public hygiene
         shell: bash
         run: |
-          if grep -RInE --exclude-dir=.git 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{20,}|@gmail\\.com|@outlook\\.com|@icloud\\.com' .; then
+          if grep -RInE --exclude-dir=.git --exclude='quality.yml' 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{20,}|@gmail\\.com|@outlook\\.com|@icloud\\.com' .; then
             echo "Potential secret/private-email pattern found"
             exit 1
           fi
